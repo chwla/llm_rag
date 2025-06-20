@@ -125,23 +125,23 @@ def initialize_session_state():
         st.session_state.available_documents = []
 
 # ============================== #
-# Optimized Document Processing
+# Document Processing Functions
 # ============================== #
 def discover_documents() -> List[str]:
-    """Discover all supported documents"""
+    """Discover all supported documents in the documents directory"""
     if not os.path.exists(DOCUMENTS_DIR):
         os.makedirs(DOCUMENTS_DIR)
         return []
-    
+
     documents = []
     for ext in SUPPORTED_EXTENSIONS:
         pattern = os.path.join(DOCUMENTS_DIR, f"*{ext}")
         documents.extend(glob.glob(pattern))
-    
+
     return sorted(documents)
 
 def get_document_loader(file_path: str, file_type: str):
-    """Get appropriate document loader"""
+    """Get appropriate document loader based on file type"""
     loaders = {
         'pdf': PyMuPDFLoader,
         'txt': TextLoader,
@@ -151,42 +151,43 @@ def get_document_loader(file_path: str, file_type: str):
         'pptx': UnstructuredPowerPointLoader,
         'ppt': UnstructuredPowerPointLoader
     }
-    
+
     loader_class = loaders.get(file_type.lower())
     if not loader_class:
         raise ValueError(f"Unsupported file type: {file_type}")
-    
+
     if file_type.lower() == 'csv':
         return loader_class(file_path, encoding='utf-8')
     else:
         return loader_class(file_path)
 
 def process_backend_document(file_path: str) -> List[Document]:
-    """Process document and return chunks"""
+    """Process document from backend directory and return chunks"""
     file_name = os.path.basename(file_path)
     file_extension = file_name.split('.')[-1].lower()
-    
+
     try:
         loader = get_document_loader(file_path, file_extension)
         docs = loader.load()
-        
-        # Add minimal metadata for performance
+
+        # Add file metadata
         file_stats = os.stat(file_path)
         for doc in docs:
             doc.metadata.update({
                 'source_file': file_name,
                 'file_type': file_extension,
-                'file_size': file_stats.st_size
+                'file_path': file_path,
+                'file_size': file_stats.st_size,
+                'modified_time': datetime.fromtimestamp(file_stats.st_mtime).isoformat()
             })
-        
-        # Optimized chunking settings
+
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=600,  # Smaller chunks for faster processing
-            chunk_overlap=100,
-            separators=["\n\n", "\n", ".", " "],
+            chunk_size=800,
+            chunk_overlap=150,
+            separators=["\n\n", "\n", ".", "?", "!", " ", ""],
         )
         return splitter.split_documents(docs)
-    
+
     except Exception as e:
         st.error(f"Error processing {file_name}: {e}")
         return []
@@ -201,8 +202,7 @@ def add_to_vector_collection(all_splits: List[Document], file_name: str):
         metadatas.append(split.metadata)
         ids.append(f"{file_name}_{idx}_{int(time.time())}")
 
-    # Larger batch size for better performance
-    BATCH_SIZE = 50
+    BATCH_SIZE = 32
     for i in range(0, len(documents), BATCH_SIZE):
         try:
             collection.upsert(
@@ -210,39 +210,83 @@ def add_to_vector_collection(all_splits: List[Document], file_name: str):
                 metadatas=metadatas[i:i+BATCH_SIZE],
                 ids=ids[i:i+BATCH_SIZE],
             )
-            # Reduced sleep time
-            time.sleep(0.1)
+            time.sleep(0.5)
         except Exception as e:
             st.error(f"Batch {i//BATCH_SIZE + 1} failed: {e}")
             return False
-    
+
     st.session_state.processed_files.add(file_name)
     return True
 
-# ============================== #
-# Background Document Loading
-# ============================== #
-@st.cache_data(ttl=600)  # Cache for 10 minutes
 def load_backend_documents():
-    """Load documents with caching"""
+    """Load all documents from the backend directory into vector store"""
+    if st.session_state.documents_loaded:
+        return
+
     document_paths = discover_documents()
-    
+    st.session_state.available_documents = [os.path.basename(path) for path in document_paths]
+
     if not document_paths:
-        return []
-    
+        st.warning("⚠️ No documents found in the documents directory. Please add some documents to get started.")
+        return
+
+    # Check if documents are already processed
     try:
         collection = get_vector_collection()
-        existing_docs = collection.get(limit=100)  # Reduced limit for speed
+        existing_docs = collection.get(limit=1000)
         existing_files = set()
         for metadata in existing_docs.get('metadatas', []):
             if metadata and 'source_file' in metadata:
                 existing_files.add(metadata['source_file'])
-        
-        return [os.path.basename(path) for path in document_paths if 
-                os.path.basename(path) in existing_files]
-    
-    except Exception:
-        return []
+
+        new_documents = [path for path in document_paths 
+                        if os.path.basename(path) not in existing_files]
+
+        if new_documents:
+            progress_bar = st.progress(0)
+            st.info(f"📚 Loading {len(new_documents)} new documents...")
+
+            for i, doc_path in enumerate(new_documents):
+                file_name = os.path.basename(doc_path)
+                try:
+                    chunks = process_backend_document(doc_path)
+                    if chunks:
+                        success = add_to_vector_collection(chunks, file_name)
+                        if success:
+                            st.success(f"✅ Loaded: {file_name}")
+                    else:
+                        st.warning(f"⚠️ No content extracted from: {file_name}")
+                except Exception as e:
+                    st.error(f"❌ Failed to load {file_name}: {e}")
+
+                progress_bar.progress((i + 1) / len(new_documents))
+
+            progress_bar.empty()
+        else:
+            st.info("📚 All documents are already loaded in the vector store.")
+            # Update processed files from existing metadata
+            for metadata in existing_docs.get('metadatas', []):
+                if metadata and 'source_file' in metadata:
+                    st.session_state.processed_files.add(metadata['source_file'])
+
+    except Exception as e:
+        st.error(f"Error checking existing documents: {e}")
+
+    st.session_state.documents_loaded = True
+
+def clear_vector_store():
+    """Clear all data from vector store"""
+    try:
+        client = chromadb.PersistentClient(path="./demo-rag-chroma")
+        client.delete_collection("rag_app")
+        st.session_state.processed_files.clear()
+        st.session_state.conversation_history.clear()
+        st.session_state.documents_loaded = False
+        st.success("🗑️ Vector store cleared successfully!")
+        return True
+    except Exception as e:
+        st.error(f"Error clearing vector store: {e}")
+        return False
 
 # ============================== #
 # Optimized Query and Ranking
@@ -368,12 +412,47 @@ if __name__ == "__main__":
     )
     
     initialize_session_state()
-    
-    # Load documents with caching
-    available_docs = load_backend_documents()
-    st.session_state.available_documents = available_docs
-    
-    # Main header
+
+    # Sidebar for system status and document management
+    st.sidebar.header("📊 System Status")
+
+    # Ollama status check
+    try:
+        collection = get_vector_collection()
+        st.sidebar.success("🤖 Models Ready")
+    except Exception as e:
+        st.sidebar.error("❌ Model Issue")
+        st.sidebar.write(f"Error: {str(e)[:50]}...")
+        st.sidebar.markdown("**Quick fix:**")
+        st.sidebar.code("ollama pull nomic-embed-text", language="bash")
+
+    # Document loading section
+    st.sidebar.subheader("📁 Document Library")
+
+    # Load backend documents automatically
+    with st.sidebar:
+        if st.button("🔄 Refresh Documents", type="secondary"):
+            st.session_state.documents_loaded = False
+            st.session_state.processed_files.clear()
+
+        load_backend_documents()
+
+    # Show document statistics
+    if st.session_state.available_documents:
+        st.sidebar.success(f"📚 {len(st.session_state.available_documents)} documents available")
+        with st.sidebar.expander("📋 Document List"):
+            for doc in st.session_state.available_documents:
+                status = "✅" if doc in st.session_state.processed_files else "⏳"
+                st.write(f"{status} {doc}")
+    else:
+        st.sidebar.info("📂 No documents found")
+        st.sidebar.markdown(f"**Add documents to:** `{DOCUMENTS_DIR}/`")
+
+    # Clear vector store option
+    if st.sidebar.button("🗑️ Clear Vector Store", type="secondary"):
+        clear_vector_store()
+
+    # Main app
     st.title("🏫 School Safety Management Q&A System")
     st.markdown("*Ask questions about fire safety protocols, disaster management guidelines, and training programs*")
     
@@ -387,10 +466,10 @@ if __name__ == "__main__":
         st.code("ollama pull nomic-embed-text\nollama pull llama3.2:3b", language="bash")
     
     # Document status
-    if not available_docs and system_ready:
+    if not st.session_state.available_documents and system_ready:
         st.info(f"Add documents to `{DOCUMENTS_DIR}` folder. Supported: PDF, TXT, CSV, DOCX, PPTX")
-    elif available_docs:
-        st.success(f"📚 **{len(available_docs)} documents loaded** - System ready")
+    elif st.session_state.available_documents:
+        st.success(f"📚 **{len(st.session_state.available_documents)} documents loaded** - System ready")
     
     # Simplified filtering (cached)
     available_files, available_types = get_available_files_and_types()
@@ -419,7 +498,7 @@ if __name__ == "__main__":
     ask = st.button("🚀 Get Answer", type="primary")
     
     if ask and prompt:
-        if not available_docs:
+        if not st.session_state.available_documents:
             st.warning("⚠️ No documents loaded. Add documents and refresh.")
         else:
             # Performance monitoring
