@@ -320,21 +320,43 @@ def re_rank_cross_encoders(
     documents: List[str], 
     top_k: int = 3
 ) -> Tuple[str, List[int], List[float]]:
-    """Optimized re-ranking with cached model"""
+    """
+    FIXED: Optimized re-ranking with proper confidence score normalization
+    
+    The original issue was that cross-encoder scores were being used directly as confidence scores.
+    Cross-encoder scores are raw logits that can be negative or very large positive numbers.
+    We need to normalize them to proper confidence percentages (0-1 range).
+    """
     encoder = get_cross_encoder()  # Use cached model
     
     # Limit document length for faster processing
     truncated_docs = [doc[:1000] for doc in documents]
     pairs = [(prompt, doc) for doc in truncated_docs]
-    scores = encoder.predict(pairs)
+    raw_scores = encoder.predict(pairs)
     
-    top_results = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
+    # FIX: Convert raw scores to proper confidence scores
+    # Method 1: Sigmoid normalization (converts any real number to 0-1 range)
+    # This is the most robust approach for cross-encoder scores
+    confidence_scores = [float(1 / (1 + np.exp(-score))) for score in raw_scores]
+    
+    # Alternative Method 2 (commented out): Min-Max normalization
+    # This would work if all scores are positive, but cross-encoder can produce negative scores
+    # min_score = float(np.min(raw_scores))
+    # max_score = float(np.max(raw_scores))
+    # if max_score > min_score:
+    #     confidence_scores = [float((score - min_score) / (max_score - min_score)) for score in raw_scores]
+    # else:
+    #     confidence_scores = [0.5] * len(raw_scores)  # Default to 50% if all scores are equal
+    
+    # Get top results based on raw scores (before normalization)
+    top_results = sorted(enumerate(raw_scores), key=lambda x: x[1], reverse=True)[:top_k]
     
     top_ids = [i for i, _ in top_results]
-    confidence_scores = [float(score) for _, score in top_results]
+    # Get the normalized confidence scores for the top results
+    top_confidence_scores = [confidence_scores[i] for i in top_ids]
     top_text = "\n\n".join([documents[i] for i in top_ids])
     
-    return top_text, top_ids, confidence_scores
+    return top_text, top_ids, top_confidence_scores
 
 # ============================== #
 # Optimized Conversation Management
@@ -519,7 +541,7 @@ if __name__ == "__main__":
                 if not raw_docs:
                     st.warning("🔍 No relevant information found. Try rephrasing your question.")
                 else:
-                    # Step 2: Re-rank (optimized)
+                    # Step 2: Re-rank (optimized with fixed confidence scores)
                     relevant_text, relevant_ids, confidence_scores = re_rank_cross_encoders(
                         prompt, raw_docs, top_k
                     )
@@ -546,14 +568,15 @@ if __name__ == "__main__":
                     total_time = time.time() - start_time
                     generation_time = time.time() - response_start
                     
-                    # Results
-                    avg_confidence = np.mean(confidence_scores)
+                    # FIXED: Results with proper confidence calculation
+                    avg_confidence = np.mean(confidence_scores)  # Now properly normalized between 0-1
                     add_to_conversation(prompt, full_response, avg_confidence)
                     
-                    # Show metrics
+                    # Show metrics with improved confidence display
                     col1, col2, col3 = st.columns(3)
                     with col1:
-                        confidence_color = "green" if avg_confidence > 0.7 else "orange" if avg_confidence > 0.4 else "red"
+                        # FIXED: Better confidence thresholds for the normalized scores
+                        confidence_color = "green" if avg_confidence > 0.75 else "orange" if avg_confidence > 0.6 else "red"
                         st.markdown(f"**Confidence:** <span style='color: {confidence_color}'>{avg_confidence:.0%}</span>", 
                                   unsafe_allow_html=True)
                     
